@@ -11,8 +11,23 @@ import (
 
 type classicFileIo struct {
 	mu      sync.Mutex
-	writers map[string]*os.File
+	writers map[string]*classicCachedFile
 	closed  bool
+}
+
+// A cached writable handle. Each write, and each borrowed reader until it is closed, holds mu for
+// reading while it uses f, and closing takes mu for writing, so closing a cached handle waits for the
+// users in flight instead of failing them with fs.ErrClosed. New users only reach it through
+// classicFileIo.mu, which is held while closing, so a pending close can't starve behind new readers.
+type classicCachedFile struct {
+	mu sync.RWMutex
+	f  *os.File
+}
+
+func (me *classicCachedFile) close() error {
+	me.mu.Lock()
+	defer me.mu.Unlock()
+	return me.f.Close()
 }
 
 func newClassicFileIo() fileIo {
@@ -42,6 +57,11 @@ func (me *classicFileIo) rename(from, to string) error {
 	if err := me.closedErr(); err != nil {
 		return err
 	}
+	// Restoring a part file after a failed piece hash renames from a complete file that usually
+	// doesn't exist. Keep the cached writers in that case: there is nothing to release.
+	if _, err := os.Lstat(from); err != nil {
+		return err
+	}
 	err := me.closeWriterLocked(from)
 	err = errors.Join(err, me.closeWriterLocked(to))
 	err = errors.Join(err, os.Rename(from, to))
@@ -54,8 +74,8 @@ func (me *classicFileIo) flush(name string, offset, nbytes int64) error {
 	if err := me.closedErr(); err != nil {
 		return err
 	}
-	if f, ok := me.writers[name]; ok {
-		return f.Sync()
+	if cached, ok := me.writers[name]; ok {
+		return cached.f.Sync()
 	}
 	return fsync(name)
 }
@@ -75,8 +95,9 @@ func (me *classicFileIo) openForRead(name string) (fileReader, error) {
 	if err := me.closedErr(); err != nil {
 		return nil, err
 	}
-	if writer, ok := me.writers[name]; ok {
-		return &classicBorrowedFileReader{f: writer}, nil
+	if cached, ok := me.writers[name]; ok {
+		cached.mu.RLock()
+		return &classicBorrowedFileReader{cached: cached, f: cached.f}, nil
 	}
 	f, err := os.Open(name)
 	return classicFileReader{f}, err
@@ -85,33 +106,53 @@ func (me *classicFileIo) openForRead(name string) (fileReader, error) {
 func (me *classicFileIo) openForWrite(p string, size int64) (f fileWriter, err error) {
 	me.mu.Lock()
 	defer me.mu.Unlock()
+	if _, err := me.cachedWriterLocked(p); err != nil {
+		return nil, err
+	}
+	return classicFileWriter{io: me, name: p}, nil
+}
+
+// Returns the cached writer for p, opening it if it was closed since, locked for use.
+func (me *classicFileIo) useWriter(p string) (*classicCachedFile, error) {
+	me.mu.Lock()
+	defer me.mu.Unlock()
+	cached, err := me.cachedWriterLocked(p)
+	if err != nil {
+		return nil, err
+	}
+	cached.mu.RLock()
+	return cached, nil
+}
+
+func (me *classicFileIo) cachedWriterLocked(p string) (*classicCachedFile, error) {
 	if err := me.closedErr(); err != nil {
 		return nil, err
 	}
 	if cached, ok := me.writers[p]; ok {
-		return classicFileWriter{cached}, nil
+		return cached, nil
 	}
-	cached, err := openFileExtra(p, os.O_RDWR)
+	f, err := openFileExtra(p, os.O_RDWR)
 	if err != nil {
 		return nil, err
 	}
 	if me.writers == nil {
-		me.writers = make(map[string]*os.File)
+		me.writers = make(map[string]*classicCachedFile)
 	}
+	cached := &classicCachedFile{f: f}
 	me.writers[p] = cached
-	return classicFileWriter{cached}, nil
+	return cached, nil
 }
 
 func (me *classicFileIo) closeWriterLocked(name string) error {
 	if me.writers == nil {
 		return nil
 	}
-	f, ok := me.writers[name]
+	cached, ok := me.writers[name]
 	if !ok {
 		return nil
 	}
 	delete(me.writers, name)
-	return f.Close()
+	return cached.close()
 }
 
 func (me *classicFileIo) closeWritersLocked() (closedPaths []string, remaining int, err error) {
@@ -124,9 +165,9 @@ func (me *classicFileIo) closeWritersLocked() (closedPaths []string, remaining i
 	}
 	sort.Strings(closedPaths)
 	for _, name := range closedPaths {
-		f := me.writers[name]
+		cached := me.writers[name]
 		delete(me.writers, name)
-		err = errors.Join(err, f.Close())
+		err = errors.Join(err, cached.close())
 	}
 	return closedPaths, len(me.writers), err
 }
@@ -138,8 +179,20 @@ func (me *classicFileIo) closedErr() error {
 	return nil
 }
 
+// Looks up the cached handle for each write, so a handle closed since the writer was opened (by a
+// rename or closeWriters) is reopened instead of failing the write.
 type classicFileWriter struct {
-	*os.File
+	io   *classicFileIo
+	name string
+}
+
+func (me classicFileWriter) WriteAt(p []byte, off int64) (int, error) {
+	cached, err := me.io.useWriter(me.name)
+	if err != nil {
+		return 0, err
+	}
+	defer cached.mu.RUnlock()
+	return cached.f.WriteAt(p, off)
 }
 
 func (classicFileWriter) Close() error {
@@ -170,11 +223,16 @@ func (c classicFileReader) seekDataOrEof(offset int64) (ret int64, err error) {
 // This is intentionally only used for openForRead, not shared readers, so the
 // borrowed handle lifetime stays scoped to storage-internal operations.
 type classicBorrowedFileReader struct {
-	f   *os.File
-	pos int64
+	cached *classicCachedFile
+	f      *os.File
+	pos    int64
 }
 
 func (c *classicBorrowedFileReader) Close() error {
+	if c.cached != nil {
+		c.cached.mu.RUnlock()
+		c.cached = nil
+	}
 	return nil
 }
 
